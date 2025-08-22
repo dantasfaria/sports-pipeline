@@ -1,0 +1,44 @@
+version: "3.8"
+
+services:
+  localstack:
+    image: localstack/localstack:latest
+    container_name: localstack
+    environment:
+      - SERVICES=s3
+      - DEBUG=0
+      - LS_LOG=warn
+      - AWS_DEFAULT_REGION=us-east-1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    ports:
+      - "4566:4566"        # edge port (S3 API on http://localhost:4566)
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - "./.localstack:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+  airflow:
+    image: apache/airflow:2.9.2-python3.11
+    container_name: airflow
+    command: standalone
+    environment:
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=True
+      - AIRFLOW_PIP_ADDITIONAL_REQUIREMENTS=boto3
+      - AIRFLOW__CORE__DEFAULT_TIMEZONE=UTC
+      - S3_ENDPOINT_URL=http://localstack:4566
+      - AIRFLOW_PIP_ADDITIONAL_REQUIREMENTS=boto3 requests pandas pyarrow
+    env_file:
+      - ../.env
+    ports:
+      - "8080:8080"        # Airflow UI -> http://localhost:8080
+    depends_on:
+      localstack:
+        condition: service_healthy
+    volumes:
+      - "/Users/gabrieldantas/Documents/developer/projects/sports-pipeline/airflow/dags:/opt/airflow/dags"
+      - "/Users/gabrieldantas/Documents/developer/projects/sports-pipeline/airflow/plugins:/opt/airflow/plugins"
+      - "/Users/gabrieldantas/Documents/developer/projects/sports-pipeline/.env:/opt/airflow/.env"
