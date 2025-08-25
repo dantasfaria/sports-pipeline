@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-import os, io, json, sys
+import os, io, json
 import boto3
 from botocore.config import Config
 import pandas as pd
@@ -7,12 +7,10 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.exceptions import AirflowSkipException
 
-# --- Settings from env (Compose injects these) ---
 BUCKET   = os.getenv("S3_BUCKET", "sports")
 ENDPOINT = os.getenv("S3_ENDPOINT_URL", "http://localstack:4566")
 REGION   = os.getenv("AWS_REGION", "us-east-1")
 
-# If someone keeps localhost in .env, make it work inside the container:
 if ENDPOINT.startswith("http://localhost"):
     ENDPOINT = ENDPOINT.replace("localhost", "localstack")
 
@@ -26,40 +24,40 @@ def _s3():
         config=Config(s3={"addressing_style": "path"}),
     )
 
-def bronze_fixtures_to_silver(**context):
+def bronze_season_to_silver(season: int, dt: str | None = None):
     """
-    Read today's bronze fixtures JSONs:
-      s3://{BUCKET}/bronze/fixtures/dt=YYYY-MM-DD/fixtures_*.json
-    Flatten into tabular columns and write:
-      s3://{BUCKET}/silver/fixtures/dt=YYYY-MM-DD/fixtures.parquet
-      (and fixtures_sample.csv for easy inspection)
+    Read bronze raw for league=73, given season; flatten to silver parquet.
+    Bronze path: s3://sports/bronze/fixtures/league=73/season=<season>/dt=<dt>/*.json
+    Silver path: s3://sports/silver/fixtures/league=73/season=<season>/dt=<dt>/fixtures.parquet
+    If dt not provided, use the latest dt= partition found under that season.
     """
     s3 = _s3()
-    dt = (context.get("dag_run") and context["dag_run"].conf.get("dt")) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    bronze_prefix = f"bronze/fixtures/dt={dt}/"
-    silver_prefix = f"silver/fixtures/dt={dt}/"
+    base_prefix = f"bronze/fixtures/league=73/season={season}/"
 
-    # 1) List bronze files for today
+    if not dt:
+        objs = list(s3.Bucket(BUCKET).objects.filter(Prefix=base_prefix))
+        dts = sorted({ key.split("/")[5].split("=")[1]
+                       for key in (o.key for o in objs) if "/dt=" in key })
+        if not dts:
+            raise AirflowSkipException(f"No bronze under s3://{BUCKET}/{base_prefix}")
+        dt = dts[-1]
+
+    bronze_prefix = f"{base_prefix}dt={dt}/"
+    silver_prefix = f"silver/fixtures/league=73/season={season}/dt={dt}/"
+
     objs = list(s3.Bucket(BUCKET).objects.filter(Prefix=bronze_prefix))
     if not objs:
-        raise AirflowSkipException(f"No bronze fixtures under s3://{BUCKET}/{bronze_prefix}")
+        raise AirflowSkipException(f"No bronze under s3://{BUCKET}/{bronze_prefix}")
 
-    # 2) Load and normalize JSON
     rows = []
     for o in objs:
         body = s3.Object(BUCKET, o.key).get()["Body"].read()
         try:
             payload = json.loads(body)
         except Exception:
-            # some runs return envelope {"endpoint":...,"data":{...}}
-            # try to peel it:
             payload = json.loads(body.decode("utf-8", "ignore"))
 
-        # API-Sports typically returns {"response": [ ... ]} possibly
-        # wrapped in an envelope we created earlier as {"data": {...}}
-        data = payload
-        if isinstance(payload, dict) and "data" in payload:
-            data = payload["data"]
+        data = payload["data"] if isinstance(payload, dict) and "data" in payload else payload
         if isinstance(data, dict) and "response" in data:
             items = data["response"]
         elif isinstance(data, list):
@@ -68,7 +66,6 @@ def bronze_fixtures_to_silver(**context):
             items = []
 
         for item in items:
-            # Safely extract commonly-used fields
             fixture = (item.get("fixture") or {})
             league  = (item.get("league") or {})
             teams   = (item.get("teams") or {})
@@ -78,95 +75,85 @@ def bronze_fixtures_to_silver(**context):
             venue   = (fixture.get("venue") or {})
 
             rows.append({
-                # Fixture
                 "fixture_id"      : fixture.get("id"),
                 "fixture_date_utc": fixture.get("date"),
-
-                # League
                 "league_id"       : league.get("id"),
                 "league_name"     : league.get("name"),
                 "league_season"   : league.get("season"),
-
-                # Teams
                 "home_team_id"    : (teams.get("home") or {}).get("id"),
                 "home_team"       : (teams.get("home") or {}).get("name"),
                 "away_team_id"    : (teams.get("away") or {}).get("id"),
                 "away_team"       : (teams.get("away") or {}).get("name"),
-
-                # Status
                 "status_short"    : status.get("short"),
                 "status_long"     : status.get("long"),
                 "status_elapsed"  : status.get("elapsed"),
-
-                # Goals
                 "goals_home"      : goals.get("home"),
                 "goals_away"      : goals.get("away"),
-
-                # Score
                 "score_ht_home"   : (score.get("halftime") or {}).get("home"),
                 "score_ht_away"   : (score.get("halftime") or {}).get("away"),
-
-                # Venue
                 "venue_name"      : venue.get("name"),
                 "venue_city"      : venue.get("city"),
             })
 
     if not rows:
-        raise AirflowSkipException("Bronze files found, but no items parsed from payload(s).")
+        raise AirflowSkipException("Bronze files found, but no items parsed.")
 
     df = pd.DataFrame(rows)
 
-    # 3) Basic cleaning/types
-    # Convert datetime strings to pandas datetime (UTC)
+    # typing / cleaning
     if "fixture_date_utc" in df.columns:
         df["fixture_ts_utc"] = pd.to_datetime(df["fixture_date_utc"], errors="coerce", utc=True)
 
-    # integers where appropriate (safe conversions)
     for col in ["fixture_id","league_id","league_season","home_team_id","away_team_id",
                 "goals_home","goals_away","score_ht_home","score_ht_away","status_elapsed"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
-    # strings trim (optional, cheap)
     for col in ["league_name","home_team","away_team","status_short","status_long","venue_name","venue_city"]:
         if col in df.columns:
             df[col] = df[col].astype("string")
 
-    # dedupe on fixture_id, keep last seen
     if "fixture_id" in df.columns:
         df = df.drop_duplicates(subset=["fixture_id"], keep="last")
 
-    # 4) Write Parquet and a small CSV sample to S3 (silver)
-    s3.Bucket(BUCKET).put_object(Key=silver_prefix)  # ensure prefix exists (noop)
-
-    # Parquet
+    # write parquet + sample
+    s3.Bucket(BUCKET).put_object(Key=silver_prefix)
     parquet_key = silver_prefix + "fixtures.parquet"
-    parquet_buf = io.BytesIO()
-    df.to_parquet(parquet_buf, index=False)
-    parquet_buf.seek(0)
-    s3.Object(BUCKET, parquet_key).put(Body=parquet_buf.getvalue())
+    csv_key     = silver_prefix + "fixtures_sample.csv"
 
-    # Small CSV sample (first 50 rows) for quick eyeballing
-    csv_key = silver_prefix + "fixtures_sample.csv"
-    csv_buf = io.StringIO()
-    df.head(50).to_csv(csv_buf, index=False)
-    s3.Object(BUCKET, csv_key).put(Body=csv_buf.getvalue().encode("utf-8"))
+    pbuf = io.BytesIO()
+    df.to_parquet(pbuf, index=False); pbuf.seek(0)
+    s3.Object(BUCKET, parquet_key).put(Body=pbuf.getvalue())
 
-    print(f"[silver] dt={dt} rows={len(df)}")
-    print(f"Wrote parquet → s3://{BUCKET}/{parquet_key}  (rows={len(df)})")
-    print(f"Wrote sample csv → s3://{BUCKET}/{csv_key}")
+    cbuf = io.StringIO()
+    df.head(50).to_csv(cbuf, index=False)
+    s3.Object(BUCKET, csv_key).put(Body=cbuf.getvalue().encode("utf-8"))
+
+    print(f"[silver] league=73 season={season} dt={dt} rows={len(df)}")
+    print(f"Wrote parquet -> s3://{BUCKET}/{parquet_key}")
+    print(f"Wrote sample -> s3://{BUCKET}/{csv_key}")
 
 default_args = {"owner": "you", "retries": 1, "retry_delay": timedelta(seconds=15)}
 
 with DAG(
-    dag_id="bronze_to_silver",
-    start_date=datetime(2025, 8, 19),
-    schedule="@daily",   # runs daily; you can also trigger manually
-    catchup=False,
-    default_args=default_args,
-    tags=["transform","fixtures","silver"],
+    dag_id       = "bronze_to_silver",
+    start_date   = datetime(2025, 8, 19),
+    schedule     = None,
+    catchup      = False,
+    default_args = default_args,
+    tags         = ["transform","fixtures","silver"],
 ) as dag:
-    PythonOperator(
-        task_id="fixtures_bronze_to_silver",
-        python_callable=bronze_fixtures_to_silver,
+    season_2021 = PythonOperator(
+        task_id         = "bronze_to_silver_2021",
+        python_callable = lambda: bronze_season_to_silver(2021),
     )
+    season_2022 = PythonOperator(
+        task_id         = "bronze_to_silver_2022",
+        python_callable = lambda: bronze_season_to_silver(2022),
+    )
+    season_2023 = PythonOperator(
+        task_id         = "bronze_to_silver_2023",
+        python_callable = lambda: bronze_season_to_silver(2023),
+    )
+
+    [season_2021, season_2022, season_2023]
