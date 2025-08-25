@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-import os, io, json
+import os, io, json, re
 import boto3
 from botocore.config import Config
 import pandas as pd
@@ -24,26 +24,37 @@ def _s3():
         config=Config(s3={"addressing_style": "path"}),
     )
 
+DT_RE = re.compile(r"/dt=([0-9]{4}-[0-9]{2}-[0-9]{2})/")
+
+def _latest_dt_under(prefix: str, s3):
+    """Return the latest dt=YYYY-MM-DD partition under prefix (robust to depth)."""
+    keys = [o.key for o in s3.Bucket(BUCKET).objects.filter(Prefix=prefix)]
+    dts = []
+    for k in keys:
+        m = DT_RE.search("/" + k)  # ensure leading slash for regex consistency
+        if m:
+            dts.append(m.group(1))
+    if not dts:
+        return None
+    return sorted(set(dts))[-1]
+
 def bronze_season_to_silver(season: int, dt: str | None = None):
     """
-    Read bronze raw for league=73, given season; flatten to silver parquet.
-    Bronze path: s3://sports/bronze/fixtures/league=73/season=<season>/dt=<dt>/*.json
-    Silver path: s3://sports/silver/fixtures/league=73/season=<season>/dt=<dt>/fixtures.parquet
+    Read bronze raw for league=629, given season; flatten to silver parquet.
+    Bronze path: s3://sports/bronze/fixtures/league=629/season=<season>/dt=<dt>/*.json
+    Silver path: s3://sports/silver/fixtures/league=629/season=<season>/dt=<dt>/fixtures.parquet
     If dt not provided, use the latest dt= partition found under that season.
     """
     s3 = _s3()
-    base_prefix = f"bronze/fixtures/league=73/season={season}/"
+    base_prefix = f"bronze/fixtures/league=629/season={season}/"
 
     if not dt:
-        objs = list(s3.Bucket(BUCKET).objects.filter(Prefix=base_prefix))
-        dts = sorted({ key.split("/")[5].split("=")[1]
-                       for key in (o.key for o in objs) if "/dt=" in key })
-        if not dts:
+        dt = _latest_dt_under(base_prefix, s3)
+        if not dt:
             raise AirflowSkipException(f"No bronze under s3://{BUCKET}/{base_prefix}")
-        dt = dts[-1]
 
     bronze_prefix = f"{base_prefix}dt={dt}/"
-    silver_prefix = f"silver/fixtures/league=73/season={season}/dt={dt}/"
+    silver_prefix = f"silver/fixtures/league=629/season={season}/dt={dt}/"
 
     objs = list(s3.Bucket(BUCKET).objects.filter(Prefix=bronze_prefix))
     if not objs:
@@ -129,7 +140,7 @@ def bronze_season_to_silver(season: int, dt: str | None = None):
     df.head(50).to_csv(cbuf, index=False)
     s3.Object(BUCKET, csv_key).put(Body=cbuf.getvalue().encode("utf-8"))
 
-    print(f"[silver] league=73 season={season} dt={dt} rows={len(df)}")
+    print(f"[silver] league=629 season={season} dt={dt} rows={len(df)}")
     print(f"Wrote parquet -> s3://{BUCKET}/{parquet_key}")
     print(f"Wrote sample -> s3://{BUCKET}/{csv_key}")
 
@@ -145,15 +156,18 @@ with DAG(
 ) as dag:
     season_2021 = PythonOperator(
         task_id         = "bronze_to_silver_2021",
-        python_callable = lambda: bronze_season_to_silver(2021),
+        python_callable = bronze_season_to_silver,
+        op_args         = [2021]
     )
     season_2022 = PythonOperator(
         task_id         = "bronze_to_silver_2022",
-        python_callable = lambda: bronze_season_to_silver(2022),
+        python_callable = bronze_season_to_silver,
+        op_args         = [2022]
     )
     season_2023 = PythonOperator(
         task_id         = "bronze_to_silver_2023",
-        python_callable = lambda: bronze_season_to_silver(2023),
+        python_callable = bronze_season_to_silver,
+        op_args         = [2023]
     )
 
     [season_2021, season_2022, season_2023]
