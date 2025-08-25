@@ -40,7 +40,7 @@ def _write_json_to_s3(prefix: str, dt: str, base_name: str, payload: dict):
 
 def fetch_championship_season_to_bronze(season: int):
     api      = FootballApiHook()
-    blob     = api.get_fixtures_today(league = 629, season = season, status = "FT")
+    blob     = api.get_fixtures(league = 629, season = season, status = "FT")
     dt = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     _write_json_to_s3(
@@ -62,15 +62,18 @@ with DAG(
 ) as dag:
     season_2021 = PythonOperator(
         task_id         = "fetch_championship_2021_to_bronze",
-        python_callable = fetch_championship_season_to_bronze(2021)
+        python_callable = fetch_championship_season_to_bronze,
+        op_args         = [2021]
     )
     season_2022 = PythonOperator(
         task_id         = "fetch_championship_2022_to_bronze",
-        python_callable = fetch_championship_season_to_bronze(2022)
+        python_callable = fetch_championship_season_to_bronze,
+        op_args         = [2022]
     )
     season_2023 = PythonOperator(
         task_id         = "fetch_championship_2023_to_bronze",
-        python_callable = fetch_championship_season_to_bronze(2023)
+        python_callable = fetch_championship_season_to_bronze,
+        op_args         = [2023]
     )
 
     [season_2021, season_2022, season_2023]
