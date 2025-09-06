@@ -113,7 +113,10 @@ def bronze_season_to_silver(season: int, dt: str | None = None):
 
     # typing / cleaning
     if "fixture_date_utc" in df.columns:
-        df["fixture_ts_utc"] = pd.to_datetime(df["fixture_date_utc"], errors="coerce", utc=True)
+        df["fixture_ts_utc"] = (
+        pd.to_datetime(df["fixture_date_utc"], errors="coerce", utc=True)
+          .dt.tz_localize(None)
+    )
 
     for col in ["fixture_id","league_id","league_season","home_team_id","away_team_id",
                 "goals_home","goals_away","score_ht_home","score_ht_away","status_elapsed"]:
@@ -133,7 +136,14 @@ def bronze_season_to_silver(season: int, dt: str | None = None):
     csv_key     = silver_prefix + "fixtures_sample.csv"
 
     pbuf = io.BytesIO()
-    df.to_parquet(pbuf, index=False); pbuf.seek(0)
+    df.to_parquet(
+        pbuf,
+        index=False,
+        engine="pyarrow",
+        coerce_timestamps="us",
+        allow_truncated_timestamps=True,
+    )
+    pbuf.seek(0)
     s3.Object(BUCKET, parquet_key).put(Body=pbuf.getvalue())
 
     cbuf = io.StringIO()
