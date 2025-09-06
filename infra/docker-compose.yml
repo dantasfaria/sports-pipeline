@@ -36,7 +36,7 @@ services:
       - HADOOP_USER_NAME=airflow
       - JAVA_TOOL_OPTIONS=-Duser.name=airflow
     ports:
-      - "8080:8080"
+      - "8082:8080"
     depends_on:
       localstack:
         condition: service_healthy
