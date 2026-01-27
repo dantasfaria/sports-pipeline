@@ -65,4 +65,4 @@ To contribute to the project, please follow these steps:
 5. Create a pull request to merge the changes
 
 ## 📬 Contact
-For any questions or concerns, please contact us at [gabrieldantasfgs@gmail.com](mailto:gabrieldantasfgs@gmail.com).
+For any questions or concerns, please contact me at [gabrieldantasfgs@gmail.com](mailto:gabrieldantasfgs@gmail.com).
